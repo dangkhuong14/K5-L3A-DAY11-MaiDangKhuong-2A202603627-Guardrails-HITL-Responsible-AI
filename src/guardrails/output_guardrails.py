@@ -13,6 +13,32 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+from core.config import load_protected_payload
+
+
+def _build_pii_patterns() -> dict[str, re.Pattern]:
+    """Keep known lab secrets covered even when no credential label is present."""
+    secrets = load_protected_payload().get("secrets", {})
+    patterns = {
+        "phone": r"(?<!\w)(?:0(?:[ .-]?\d){9,10}|\+84(?:[ .-]?\d){9})(?!\w)",
+        "email": r"(?<![\w.+-])[\w.+-]+@(?:[a-z0-9-]+\.)+[a-z]{2,}(?![\w-])",
+        "national_id": r"\b(?:\d{12}|\d{9})\b",
+        "api_key": r"\bsk-[a-z0-9_-]+",
+        "password": r'''\b(?:password|mật\s*khẩu)\s*(?:[:=]\s*|(?:is|là)\s+)(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s,;]+)''',
+    }
+    for field, category in (("admin_password", "password"), ("api_key", "api_key"), ("db_host", "db_host")):
+        value = str(secrets.get(field) or "")
+        if not value:
+            continue
+        values = [value]
+        if category == "db_host":
+            values.append(value.split(":", 1)[0])
+        literal_pattern = "|".join(re.escape(value) for value in sorted(set(values), key=len, reverse=True))
+        patterns[category] = "|".join(filter(None, (patterns.get(category), literal_pattern)))
+    return {name: re.compile(pattern, re.IGNORECASE) for name, pattern in patterns.items()}
+
+
+PII_PATTERNS = _build_pii_patterns()
 
 
 # ============================================================
@@ -37,28 +63,32 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
-
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
+    spans = []
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = list(pattern.finditer(response))
         if matches:
             issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            spans.extend(match.span() for match in matches)
+
+    # Find all spans on the original text, then merge overlaps before redacting.
+    # This avoids leaving fragments when the same value matches two categories.
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    chunks = []
+    cursor = 0
+    for start, end in merged:
+        chunks.extend((response[cursor:start], "[REDACTED]"))
+        cursor = end
+    chunks.append(response[cursor:])
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
-        "redacted": redacted,
+        "redacted": "".join(chunks),
     }
 
 
@@ -154,10 +184,23 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         """Extract text from LLM response."""
         text = ""
         if hasattr(llm_response, "content") and llm_response.content:
-            for part in llm_response.content.parts:
+            for part in llm_response.content.parts or []:
                 if hasattr(part, "text") and part.text:
                     text += part.text
         return text
+
+    def _replace_text(self, llm_response, text: str):
+        """Replace the combined text, preserving non-text parts and response metadata."""
+        parts = []
+        replaced = False
+        for part in llm_response.content.parts or []:
+            if part.text:
+                if not replaced:
+                    parts.append(types.Part.from_text(text=text))
+                    replaced = True
+            else:
+                parts.append(part)
+        llm_response.content = llm_response.content.model_copy(update={"parts": parts})
 
     async def after_model_callback(
         self,
@@ -172,16 +215,19 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self._replace_text(llm_response, result["redacted"])
+            self.redacted_count += 1
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            # Never forward the original leaked PII/secret to an optional judge.
+            verdict = await llm_safety_check(result["redacted"])
+            if not verdict["safe"]:
+                self._replace_text(llm_response, "Tôi không thể cung cấp nội dung này. Vui lòng hỏi về dịch vụ ngân hàng.")
+                self.blocked_count += 1
+
+        return llm_response
 
 
 # ============================================================
