@@ -482,7 +482,7 @@ async def generate_ai_attacks() -> list:
         )
         text = response.text or ""
     else:
-        raise RuntimeError("RED_TEAM_PROVIDER phải là openai hoặc gemini.")
+        raise RuntimeError("RED_TEAM_PROVIDER phải là openai, gemini hoặc anthropic.")
 
     print("AI-Generated Attack Prompts (Aggressive):")
     print("=" * 60)
